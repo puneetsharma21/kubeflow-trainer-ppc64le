@@ -1,0 +1,125 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: torch-save-resume-checkpoint
+  namespace: redhat-ods-operator
+spec:
+  runtimeRef:
+    name: torch-distributed-cpu-ppc64le-checkpoint
+
+  trainer:
+    numNodes: 2
+
+    command:
+      - python
+
+    args:
+      - -c
+      - |
+        import os
+        import time
+        import torch
+
+        CHECKPOINT_DIR = "/mnt/checkpoints"
+        CHECKPOINT_PATH = os.path.join(
+            CHECKPOINT_DIR,
+            "checkpoint.pt"
+        )
+
+        rank = int(os.environ.get("PET_NODE_RANK", "0"))
+        world_size = int(os.environ.get("PET_NNODES", "1"))
+
+        print("=== PYTORCH CHECKPOINT TEST ===", flush=True)
+        print(f"Node rank: {rank}", flush=True)
+        print(f"World size: {world_size}", flush=True)
+        print(f"Checkpoint path: {CHECKPOINT_PATH}", flush=True)
+
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+        start_step = 0
+
+        # Restore from checkpoint if it exists.
+        if os.path.exists(CHECKPOINT_PATH):
+            checkpoint = torch.load(
+                CHECKPOINT_PATH,
+                map_location="cpu"
+            )
+
+            start_step = checkpoint["step"] + 1
+
+            print(
+                f"CHECKPOINT FOUND - resuming from step {start_step}",
+                flush=True
+            )
+
+        else:
+            print(
+                "NO CHECKPOINT FOUND - starting from step 0",
+                flush=True
+            )
+
+        # Simulated training loop.
+        for step in range(start_step, 60):
+
+            print(
+                f"Node rank {rank}: Training step {step}",
+                flush=True
+            )
+
+            time.sleep(10)
+
+            # Save checkpoint periodically.
+            if rank == 0 and step % 5 == 0:
+                checkpoint = {
+                    "step": step,
+                    "node_rank": rank,
+                    "world_size": world_size,
+                }
+
+                tmp_path = CHECKPOINT_PATH + ".tmp"
+
+                torch.save(
+                    checkpoint,
+                    tmp_path
+                )
+
+                os.replace(
+                    tmp_path,
+                    CHECKPOINT_PATH
+                )
+
+                print(
+                    f"CHECKPOINT SAVED at step {step}",
+                    flush=True
+                )
+
+        print(
+            f"Training completed on node rank {rank}",
+            flush=True
+        )
+
+
+# ============================================================
+#        TrainJob Worker Failure & Checkpoint Resume Flow
+# ============================================================
+#
+#                       TrainJob
+#                          ↓
+#                    2 workers created
+#                          ↓
+#                     Shared RWX PVC
+#                          ↓
+#                  Checkpoint written
+#                          ↓
+#                    Worker pod deleted
+#                          ↓
+#                 Trainer recreates worker
+#                          ↓
+#              Replacement worker mounts
+#                   the same PVC
+#                          ↓
+#                 Checkpoint detected
+#                          ↓
+#             Training resumes from checkpoint
+#
+# ============================================================

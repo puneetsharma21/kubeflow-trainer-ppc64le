@@ -1,0 +1,24 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: torch-suspend-resume
+  namespace: redhat-ods-operator
+spec:
+  runtimeRef:
+    name: torch-distributed-cpu-ppc64le-checkpoint
+  trainer:
+    numNodes: 2
+    command:
+      - python
+    args:
+      - -c
+      - |
+        import time
+        import os
+
+        print("=== SUSPEND/RESUME TEST ===", flush=True)
+        print(f"Node rank: {os.environ.get('PET_NODE_RANK')}", flush=True)
+
+        for i in range(600):
+            print(f"Training step: {i}", flush=True)
+            time.sleep(10)

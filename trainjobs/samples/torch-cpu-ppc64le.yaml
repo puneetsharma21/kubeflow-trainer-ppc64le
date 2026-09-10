@@ -1,0 +1,27 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: torch-cpu-ppc64le
+  namespace: redhat-ods-operator
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: ClusterTrainingRuntime
+    name: torch-distributed-cpu-ppc64le
+  trainer:
+    command:
+      - python
+    args:
+      - -c
+      - |
+        import torch
+
+        print("=== Trainer test ===")
+        print("PyTorch version:", torch.__version__)
+
+        if torch.distributed.is_initialized():
+            print("World size:", torch.distributed.get_world_size())
+        else:
+            print("World size: 1")
+
+        print("Training pod started successfully")

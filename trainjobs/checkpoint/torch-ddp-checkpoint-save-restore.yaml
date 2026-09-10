@@ -1,0 +1,630 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: torch-ddp-checkpoint-save-restore
+  namespace: redhat-ods-operator
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: ClusterTrainingRuntime
+    name: torch-distributed-cpu-ppc64le-checkpoint
+
+  trainer:
+    command:
+      - python
+
+    args:
+      - -c
+      - |
+        import os
+        import time
+        import socket
+
+        import torch
+        import torch.nn as nn
+        import torch.optim as optim
+        import torch.distributed as dist
+
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        from torch.utils.data import DataLoader
+        from torch.utils.data.distributed import DistributedSampler
+        from torchvision import datasets, transforms
+
+
+        # ============================================================
+        # Distributed environment
+        # ============================================================
+
+        nnodes = int(os.environ["PET_NNODES"])
+        nproc_per_node = int(os.environ["PET_NPROC_PER_NODE"])
+        node_rank = int(os.environ["PET_NODE_RANK"])
+
+        local_rank = 0
+
+        rank = node_rank * nproc_per_node
+        world_size = nnodes * nproc_per_node
+
+        master_addr = os.environ["PET_MASTER_ADDR"]
+        master_port = os.environ["PET_MASTER_PORT"]
+
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+
+        os.environ["MASTER_ADDR"] = master_addr
+        os.environ["MASTER_PORT"] = master_port
+
+        hostname = socket.gethostname()
+
+
+        print("=" * 70, flush=True)
+        print("PYTORCH DDP CHECKPOINT SAVE/RESTORE TEST", flush=True)
+        print("=" * 70, flush=True)
+
+        print(f"Hostname:              {hostname}", flush=True)
+        print(f"Rank:                  {rank}", flush=True)
+        print(f"World size:            {world_size}", flush=True)
+        print(f"Local rank:            {local_rank}", flush=True)
+        print(f"PET_NNODES:            {nnodes}", flush=True)
+        print(f"PET_NPROC_PER_NODE:    {nproc_per_node}", flush=True)
+        print(f"PET_NODE_RANK:         {node_rank}", flush=True)
+        print(f"MASTER_ADDR:           {master_addr}", flush=True)
+        print(f"MASTER_PORT:           {master_port}", flush=True)
+        print(f"PyTorch:               {torch.__version__}", flush=True)
+
+        print("=" * 70, flush=True)
+
+
+        # ============================================================
+        # Validate expected configuration
+        # ============================================================
+
+        if nnodes != 2:
+            raise RuntimeError(
+                f"Expected 2 nodes, got {nnodes}"
+            )
+
+        if nproc_per_node != 1:
+            raise RuntimeError(
+                f"Expected 1 process per node, got {nproc_per_node}"
+            )
+
+        if world_size != 2:
+            raise RuntimeError(
+                f"Expected world size 2, got {world_size}"
+            )
+
+        if rank not in (0, 1):
+            raise RuntimeError(
+                f"Expected rank 0 or 1, got {rank}"
+            )
+
+
+        # ============================================================
+        # Initialize Gloo
+        # ============================================================
+
+        print(
+            f"[Rank {rank}] Initializing Gloo...",
+            flush=True
+        )
+
+        dist.init_process_group(
+            backend="gloo",
+            init_method="env://"
+        )
+
+        print(
+            f"[Rank {rank}] Process group initialized",
+            flush=True
+        )
+
+        print(
+            f"[Rank {rank}] "
+            f"dist.get_rank()={dist.get_rank()}",
+            flush=True
+        )
+
+        print(
+            f"[Rank {rank}] "
+            f"dist.get_world_size()={dist.get_world_size()}",
+            flush=True
+        )
+
+
+        # ============================================================
+        # Checkpoint directory
+        # ============================================================
+
+        checkpoint_dir = "/mnt/checkpoints"
+        checkpoint_path = "/mnt/checkpoints/ddp_checkpoint.pt"
+
+        print(
+            f"[Rank {rank}] Checking checkpoint directory: "
+            f"{checkpoint_dir}",
+            flush=True
+        )
+
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        print(
+            f"[Rank {rank}] Checkpoint directory available",
+            flush=True
+        )
+
+
+        # ============================================================
+        # Dataset
+        # ============================================================
+
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                (0.1307,),
+                (0.3081,)
+            )
+        ])
+
+        dataset = datasets.MNIST(
+            root="/tmp/data",
+            train=True,
+            download=True,
+            transform=transform
+        )
+
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=256,
+            sampler=sampler,
+            num_workers=4,
+            pin_memory=False
+        )
+
+        if rank == 0:
+            print("=" * 70, flush=True)
+            print("DATASET", flush=True)
+            print("=" * 70, flush=True)
+            print(
+                f"Dataset size: {len(dataset)}",
+                flush=True
+            )
+            print(
+                "Batch size: 256",
+                flush=True
+            )
+            print(
+                f"Steps/epoch: {len(dataloader)}",
+                flush=True
+            )
+
+
+        # ============================================================
+        # CPU model
+        # ============================================================
+
+        class MLP(nn.Module):
+
+            def __init__(self):
+                super().__init__()
+
+                self.network = nn.Sequential(
+                    nn.Flatten(),
+
+                    nn.Linear(28 * 28, 2048),
+                    nn.ReLU(),
+
+                    nn.Linear(2048, 4096),
+                    nn.ReLU(),
+
+                    nn.Linear(4096, 4096),
+                    nn.ReLU(),
+
+                    nn.Linear(4096, 2048),
+                    nn.ReLU(),
+
+                    nn.Linear(2048, 10)
+                )
+
+            def forward(self, x):
+                return self.network(x)
+
+
+        model = MLP()
+        model = DDP(model)
+
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=0.01,
+            momentum=0.9
+        )
+
+        criterion = nn.CrossEntropyLoss()
+
+
+        # ============================================================
+        # Training
+        # ============================================================
+
+        epochs = 3
+
+        print(
+            f"[Rank {rank}] Starting training for "
+            f"{epochs} epochs",
+            flush=True
+        )
+
+        for epoch in range(epochs):
+
+            sampler.set_epoch(epoch)
+
+            model.train()
+
+            epoch_start = time.time()
+
+            total_loss = 0.0
+            correct = 0
+            total = 0
+
+            for batch_idx, (images, labels) in enumerate(dataloader):
+
+                optimizer.zero_grad()
+
+                outputs = model(images)
+
+                loss = criterion(
+                    outputs,
+                    labels
+                )
+
+                loss.backward()
+
+                optimizer.step()
+
+                total_loss += loss.item()
+
+                predictions = outputs.argmax(dim=1)
+
+                correct += (
+                    predictions == labels
+                ).sum().item()
+
+                total += labels.size(0)
+
+                if batch_idx % 20 == 0:
+                    print(
+                        f"[Rank {rank}] "
+                        f"Epoch {epoch + 1}/{epochs} "
+                        f"Step {batch_idx}/{len(dataloader)} "
+                        f"Loss {loss.item():.4f}",
+                        flush=True
+                    )
+
+            epoch_time = time.time() - epoch_start
+
+            accuracy = (
+                100.0 * correct / total
+            )
+
+            average_loss = (
+                total_loss / len(dataloader)
+            )
+
+            print(
+                f"[Rank {rank}] "
+                f"Epoch {epoch + 1}/{epochs} "
+                f"Loss {average_loss:.4f} "
+                f"Accuracy {accuracy:.2f}% "
+                f"Time {epoch_time:.2f}s",
+                flush=True
+            )
+
+
+            # --------------------------------------------------------
+            # Synchronize ranks after epoch
+            # --------------------------------------------------------
+
+            dist.barrier()
+
+
+            # ========================================================
+            # SAVE CHECKPOINT AFTER EPOCH 2
+            # ========================================================
+
+            if epoch == 1:
+
+                if rank == 0:
+
+                    print("=" * 70, flush=True)
+                    print(
+                        "[Rank 0] Saving checkpoint...",
+                        flush=True
+                    )
+
+                    checkpoint = {
+                        "epoch": epoch,
+                        "model_state_dict":
+                            model.module.state_dict(),
+                        "optimizer_state_dict":
+                            optimizer.state_dict(),
+                        "loss": average_loss,
+                        "accuracy": accuracy,
+                        "world_size": world_size,
+                        "pytorch_version":
+                            str(torch.__version__)
+                    }
+
+                    torch.save(
+                        checkpoint,
+                        checkpoint_path
+                    )
+
+                    print(
+                        f"[Rank 0] Checkpoint saved to "
+                        f"{checkpoint_path}",
+                        flush=True
+                    )
+
+                    print(
+                        f"[Rank 0] Checkpoint size: "
+                        f"{os.path.getsize(checkpoint_path)} bytes",
+                        flush=True
+                    )
+
+                    print("=" * 70, flush=True)
+
+
+                # ----------------------------------------------------
+                # Make sure rank 0 finished writing before other
+                # ranks continue.
+                # ----------------------------------------------------
+
+                dist.barrier()
+
+
+                # ----------------------------------------------------
+                # Verify checkpoint from every rank
+                # ----------------------------------------------------
+
+                checkpoint_exists = os.path.exists(
+                    checkpoint_path
+                )
+
+                print(
+                    f"[Rank {rank}] "
+                    f"Checkpoint exists: "
+                    f"{checkpoint_exists}",
+                    flush=True
+                )
+
+                if not checkpoint_exists:
+
+                    raise RuntimeError(
+                        f"[Rank {rank}] "
+                        f"Checkpoint was not visible at "
+                        f"{checkpoint_path}"
+                    )
+
+                print(
+                    f"[Rank {rank}] "
+                    f"Checkpoint visibility SUCCESS",
+                    flush=True
+                )
+
+                dist.barrier()
+
+
+        # ============================================================
+        # Verify checkpoint can be loaded
+        #
+        # PyTorch 2.6+ defaults torch.load() to weights_only=True.
+        #
+        # This checkpoint contains metadata and optimizer state, and
+        # was created by this trusted test job. Therefore explicitly
+        # use weights_only=False.
+        # ============================================================
+
+        dist.barrier()
+
+        print(
+            f"[Rank {rank}] Loading checkpoint...",
+            flush=True
+        )
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False
+        )
+
+        print(
+            f"[Rank {rank}] Checkpoint loaded successfully",
+            flush=True
+        )
+
+        print(
+            f"[Rank {rank}] "
+            f"Checkpoint epoch: "
+            f"{checkpoint['epoch'] + 1}",
+            flush=True
+        )
+
+        print(
+            f"[Rank {rank}] "
+            f"Checkpoint loss: "
+            f"{checkpoint['loss']:.4f}",
+            flush=True
+        )
+
+        print(
+            f"[Rank {rank}] "
+            f"Checkpoint accuracy: "
+            f"{checkpoint['accuracy']:.2f}%",
+            flush=True
+        )
+
+        print(
+            f"[Rank {rank}] "
+            f"Checkpoint world size: "
+            f"{checkpoint['world_size']}",
+            flush=True
+        )
+
+        print(
+            f"[Rank {rank}] "
+            f"Checkpoint PyTorch version: "
+            f"{checkpoint['pytorch_version']}",
+            flush=True
+        )
+
+
+        # ============================================================
+        # Validate checkpoint world size
+        # ============================================================
+
+        if checkpoint["world_size"] != world_size:
+            raise RuntimeError(
+                f"[Rank {rank}] "
+                f"Checkpoint world_size="
+                f"{checkpoint['world_size']} "
+                f"does not match current world_size="
+                f"{world_size}"
+            )
+
+        print(
+            f"[Rank {rank}] "
+            f"Checkpoint world size validation SUCCESS",
+            flush=True
+        )
+
+
+        # ============================================================
+        # Restore model and optimizer
+        # ============================================================
+
+        print(
+            f"[Rank {rank}] Creating fresh model for restore...",
+            flush=True
+        )
+
+        restored_model = MLP()
+
+        restored_model.load_state_dict(
+            checkpoint["model_state_dict"]
+        )
+
+        print(
+            f"[Rank {rank}] "
+            f"Model state restored successfully",
+            flush=True
+        )
+
+
+        print(
+            f"[Rank {rank}] Creating optimizer for restore...",
+            flush=True
+        )
+
+        restored_optimizer = optim.SGD(
+            restored_model.parameters(),
+            lr=0.01,
+            momentum=0.9
+        )
+
+        restored_optimizer.load_state_dict(
+            checkpoint["optimizer_state_dict"]
+        )
+
+        print(
+            f"[Rank {rank}] "
+            f"Optimizer state restored successfully",
+            flush=True
+        )
+
+        restored_model.eval()
+
+
+        # ============================================================
+        # Final distributed synchronization
+        # ============================================================
+
+        dist.barrier()
+
+        if rank == 0:
+
+            print("=" * 70, flush=True)
+            print(
+                "CHECKPOINT SAVE/RESTORE TEST SUCCESSFUL",
+                flush=True
+            )
+            print(
+                f"World size: {world_size}",
+                flush=True
+            )
+            print(
+                "Checkpoint: /mnt/checkpoints/ddp_checkpoint.pt",
+                flush=True
+            )
+            print(
+                "Saved after epoch: 2",
+                flush=True
+            )
+            print(
+                "Model state restored successfully",
+                flush=True
+            )
+            print(
+                "Optimizer state restored successfully",
+                flush=True
+            )
+            print(
+                "Restored successfully on all ranks",
+                flush=True
+            )
+            print("=" * 70, flush=True)
+
+
+        dist.destroy_process_group()
+
+        print(
+            f"[Rank {rank}] Process finished successfully",
+            flush=True
+        )
+
+
+# ============================================================
+#        TrainJob Checkpoint Save & Restore Flow
+# ============================================================
+#
+#                    TrainJob starts
+#                         ↓
+#                     2 pods start
+#                         ↓
+#                  Gloo + DDP initialize
+#                         ↓
+#                    MNIST training
+#                         ↓
+#                     After epoch 2
+#                         ↓
+#              Rank 0 saves checkpoint
+#                 (model + optimizer)
+#                         ↓
+#                Workers continue training
+#                         ↓
+#                Workers load checkpoint
+#                         ↓
+#                  Fresh model created
+#                         ↓
+#             Restore model + optimizer state
+#                         ↓
+#                    Verify restore
+#                         ↓
+#                    Job completes
+#
+# ============================================================

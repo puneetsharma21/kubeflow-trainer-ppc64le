@@ -1,0 +1,357 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: torch-ddp-gloo-2node
+  namespace: redhat-ods-operator
+
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: ClusterTrainingRuntime
+    name: torch-distributed-cpu-ppc64le-2node
+
+  trainer:
+    numNodes: 2
+
+    command:
+      - python
+
+    args:
+      - -c
+      - |
+        import os
+        import socket
+        import time
+        import traceback
+
+        import torch
+        import torch.distributed as dist
+
+
+        # ---------------------------------------------------------
+        # Trainer distributed environment
+        # ---------------------------------------------------------
+
+        node_rank = int(
+            os.environ["PET_NODE_RANK"]
+        )
+
+        num_nodes = int(
+            os.environ["PET_NNODES"]
+        )
+
+        processes_per_node = int(
+            os.environ["PET_NPROC_PER_NODE"]
+        )
+
+        rank = (
+            node_rank * processes_per_node
+        )
+
+        world_size = (
+            num_nodes * processes_per_node
+        )
+
+        master_addr = os.environ[
+            "PET_MASTER_ADDR"
+        ]
+
+        master_port = os.environ[
+            "PET_MASTER_PORT"
+        ]
+
+        hostname = socket.gethostname()
+
+
+        # ---------------------------------------------------------
+        # Environment information
+        # ---------------------------------------------------------
+
+        print("=" * 70, flush=True)
+        print(
+            "2-NODE PYTORCH GLOO DEBUG TEST",
+            flush=True
+        )
+        print("=" * 70, flush=True)
+
+        print(
+            f"Hostname:              {hostname}",
+            flush=True
+        )
+
+        print(
+            f"Node rank:             {node_rank}",
+            flush=True
+        )
+
+        print(
+            f"Rank:                  {rank}",
+            flush=True
+        )
+
+        print(
+            f"World size:            {world_size}",
+            flush=True
+        )
+
+        print(
+            f"Processes/node:        {processes_per_node}",
+            flush=True
+        )
+
+        print(
+            f"PET_MASTER_ADDR:       {master_addr}",
+            flush=True
+        )
+
+        print(
+            f"PET_MASTER_PORT:       {master_port}",
+            flush=True
+        )
+
+        print(
+            f"PyTorch:               {torch.__version__}",
+            flush=True
+        )
+
+        print(
+            f"torch.distributed available: "
+            f"{dist.is_available()}",
+            flush=True
+        )
+
+
+        # ---------------------------------------------------------
+        # Set standard distributed environment variables
+        # ---------------------------------------------------------
+
+        os.environ["RANK"] = str(rank)
+
+        os.environ["WORLD_SIZE"] = str(
+            world_size
+        )
+
+        os.environ["LOCAL_RANK"] = str(
+            rank % processes_per_node
+        )
+
+        os.environ["MASTER_ADDR"] = master_addr
+
+        os.environ["MASTER_PORT"] = master_port
+
+
+        print("=" * 70, flush=True)
+        print(
+            f"[Rank {rank}] Environment prepared",
+            flush=True
+        )
+
+        print(
+            f"RANK={os.environ['RANK']}",
+            flush=True
+        )
+
+        print(
+            f"WORLD_SIZE={os.environ['WORLD_SIZE']}",
+            flush=True
+        )
+
+        print(
+            f"LOCAL_RANK={os.environ['LOCAL_RANK']}",
+            flush=True
+        )
+
+        print(
+            f"MASTER_ADDR={os.environ['MASTER_ADDR']}",
+            flush=True
+        )
+
+        print(
+            f"MASTER_PORT={os.environ['MASTER_PORT']}",
+            flush=True
+        )
+
+
+        # ---------------------------------------------------------
+        # Distributed test
+        # ---------------------------------------------------------
+
+        try:
+
+            print("=" * 70, flush=True)
+
+            print(
+                f"[Rank {rank}] "
+                f"Initializing Gloo...",
+                flush=True
+            )
+
+            dist.init_process_group(
+                backend="gloo",
+                init_method="env://"
+            )
+
+            print(
+                f"[Rank {rank}] "
+                f"Process group initialized",
+                flush=True
+            )
+
+
+            # -----------------------------------------------------
+            # Verify world size
+            # -----------------------------------------------------
+
+            actual_world_size = (
+                dist.get_world_size()
+            )
+
+            actual_rank = (
+                dist.get_rank()
+            )
+
+            print(
+                f"[Rank {rank}] "
+                f"dist.get_rank()={actual_rank}",
+                flush=True
+            )
+
+            print(
+                f"[Rank {rank}] "
+                f"dist.get_world_size()="
+                f"{actual_world_size}",
+                flush=True
+            )
+
+
+            # -----------------------------------------------------
+            # all_reduce
+            # -----------------------------------------------------
+
+            tensor = torch.tensor(
+                [float(rank + 1)],
+                dtype=torch.float32
+            )
+
+            print(
+                f"[Rank {rank}] "
+                f"Before all_reduce: "
+                f"{tensor.item()}",
+                flush=True
+            )
+
+            dist.all_reduce(
+                tensor,
+                op=dist.ReduceOp.SUM
+            )
+
+            print(
+                f"[Rank {rank}] "
+                f"After all_reduce: "
+                f"{tensor.item()}",
+                flush=True
+            )
+
+            expected = (
+                world_size
+                * (world_size + 1)
+                / 2
+            )
+
+            if tensor.item() != expected:
+
+                raise RuntimeError(
+                    f"all_reduce failed: "
+                    f"expected {expected}, "
+                    f"got {tensor.item()}"
+                )
+
+            print(
+                f"[Rank {rank}] "
+                f"all_reduce SUCCESS",
+                flush=True
+            )
+
+
+            # -----------------------------------------------------
+            # Barrier
+            # -----------------------------------------------------
+
+            print(
+                f"[Rank {rank}] "
+                f"Entering barrier...",
+                flush=True
+            )
+
+            dist.barrier()
+
+            print(
+                f"[Rank {rank}] "
+                f"barrier SUCCESS",
+                flush=True
+            )
+
+
+            # -----------------------------------------------------
+            # Success
+            # -----------------------------------------------------
+
+            if rank == 0:
+
+                print("=" * 70, flush=True)
+
+                print(
+                    "2-NODE PYTORCH GLOO TEST SUCCESSFUL",
+                    flush=True
+                )
+
+                print(
+                    f"World size: {world_size}",
+                    flush=True
+                )
+
+                print("=" * 70, flush=True)
+
+
+            dist.destroy_process_group()
+
+            print(
+                f"[Rank {rank}] "
+                f"Process finished successfully",
+                flush=True
+            )
+
+
+        except Exception as e:
+
+            print("=" * 70, flush=True)
+
+            print(
+                f"[Rank {rank}] "
+                f"DISTRIBUTED TEST FAILED",
+                flush=True
+            )
+
+            print(
+                f"Exception type: "
+                f"{type(e).__name__}",
+                flush=True
+            )
+
+            print(
+                f"Exception: {repr(e)}",
+                flush=True
+            )
+
+            print("=" * 70, flush=True)
+
+            traceback.print_exc()
+
+            print(
+                f"[Rank {rank}] "
+                f"Sleeping for 1 hour "
+                f"for debugging...",
+                flush=True
+            )
+
+            time.sleep(3600)

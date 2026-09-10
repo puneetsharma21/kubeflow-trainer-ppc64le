@@ -1,0 +1,83 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: torch-ddp-distributed-env-ppc64le
+  namespace: redhat-ods-operator
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: ClusterTrainingRuntime
+    name: torch-distributed-cpu-ppc64le
+
+  trainer:
+    command:
+      - bash
+      - -c
+    args:
+      - |
+        cat > /tmp/distributed_test.py <<'PYTHON'
+        import os
+        import socket
+
+        import torch
+        import torch.distributed as dist
+
+        device, backend = (
+            ("cuda", "nccl")
+            if torch.cuda.is_available()
+            else ("cpu", "gloo")
+        )
+
+        print("=" * 60)
+        print("PyTorch Distributed Environment")
+        print("=" * 60)
+        print(f"Hostname: {socket.gethostname()}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"Using device: {device}")
+        print(f"Using backend: {backend}")
+
+        dist.init_process_group(backend=backend)
+
+        print(f"WORLD_SIZE: {dist.get_world_size()}")
+        print(f"RANK: {dist.get_rank()}")
+        print(f"LOCAL_RANK: {os.environ['LOCAL_RANK']}")
+
+        print("=" * 60)
+
+        dist.barrier()
+
+        if dist.get_rank() == 0:
+            print("Distributed PyTorch environment test PASSED")
+
+        dist.destroy_process_group()
+        PYTHON
+
+        echo "Starting torchrun..."
+        echo "PET_NNODES=${PET_NNODES}"
+        echo "PET_NPROC_PER_NODE=${PET_NPROC_PER_NODE}"
+        echo "PET_NODE_RANK=${PET_NODE_RANK}"
+        echo "PET_MASTER_ADDR=${PET_MASTER_ADDR}"
+        echo "PET_MASTER_PORT=${PET_MASTER_PORT}"
+
+        exec torchrun \
+          --nnodes="${PET_NNODES}" \
+          --nproc-per-node="${PET_NPROC_PER_NODE}" \
+          --node-rank="${PET_NODE_RANK}" \
+          --master-addr="${PET_MASTER_ADDR}" \
+          --master-port="${PET_MASTER_PORT}" \
+          /tmp/distributed_test.py
+
+
+# ============================================================
+#             Kubeflow Trainer Execution Flow
+# ============================================================
+#
+#                    Kubeflow Trainer
+#                           ↓
+#                       PET_* variables
+#                           ↓
+#                         torchrun
+#                           ↓
+#                  PyTorch Distributed
+#
+# ============================================================
